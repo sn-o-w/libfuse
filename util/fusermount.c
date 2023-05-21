@@ -1257,7 +1257,7 @@ int main(int argc, char *argv[])
 	static int unmount = 0;
 	static int lazy = 0;
 	static int quiet = 0;
-	char *commfd;
+	char *commfd = NULL;
 	int cfd;
 	const char *opts = "";
 
@@ -1267,6 +1267,9 @@ int main(int argc, char *argv[])
 		{"quiet",   no_argument, NULL, 'q'},
 		{"help",    no_argument, NULL, 'h'},
 		{"version", no_argument, NULL, 'V'},
+		// Note: comm-fd doesn't have short version.
+		// It is meant for internal use by mount.c
+		{"comm-fd", required_argument, NULL, 'c'},
 		{0, 0, 0, 0}};
 
 	progname = strdup(argv[0]);
@@ -1292,6 +1295,10 @@ int main(int argc, char *argv[])
 
 		case 'u':
 			unmount = 1;
+			break;
+
+		case 'c':
+			commfd = optarg;
 			break;
 
 		case 'z':
@@ -1340,7 +1347,8 @@ int main(int argc, char *argv[])
 	if (unmount)
 		goto do_unmount;
 
-	commfd = getenv(FUSE_COMMFD_ENV);
+	if(commfd == NULL)
+		commfd = getenv(FUSE_COMMFD_ENV);
 	if (commfd == NULL) {
 		fprintf(stderr, "%s: old style mounting not supported\n",
 			progname);
@@ -1352,9 +1360,22 @@ int main(int argc, char *argv[])
 		exit(1);
 
 	cfd = atoi(commfd);
+	{
+		struct stat statbuf;
+		fstat(cfd, &statbuf);
+		if(!S_ISSOCK(statbuf.st_mode)) {
+			fprintf(stderr,
+				"%s: file descriptor %i is not a socket, can't send fuse fd\n",
+				progname, cfd);
+			free(mnt);
+			exit(1);
+		}
+	}
 	res = send_fd(cfd, fd);
-	if (res == -1)
+	if (res != 0) {
+		umount2(mnt, MNT_DETACH); /* lazy umount */
 		exit(1);
+	}
 	close(fd);
 
 	if (!auto_unmount)

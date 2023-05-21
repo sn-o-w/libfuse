@@ -6,6 +6,11 @@
   See the file COPYING.LIB.
 */
 
+/* For environ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "config.h"
 #include "fuse_i.h"
 #include "fuse_misc.h"
@@ -20,6 +25,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <spawn.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -41,10 +47,6 @@
 
 #define FUSERMOUNT_PROG		"fusermount"
 #define FUSE_COMMFD_ENV		"_FUSE_COMMFD"
-
-#ifndef HAVE_FORK
-#define fork() vfork()
-#endif
 
 #ifndef MS_DIRSYNC
 #define MS_DIRSYNC 128
@@ -141,20 +143,17 @@ static void mount_help(void)
 "\n");
 }
 
-static void exec_fusermount(const char *argv[])
-{
-	execv(FUSERMOUNT_DIR "/" FUSERMOUNT_PROG, (char **) argv);
-	execvp(FUSERMOUNT_PROG, (char **) argv);
-}
-
 static void mount_version(void)
 {
-	int pid = fork();
-	if (!pid) {
-		const char *argv[] = { FUSERMOUNT_PROG, "--version", NULL };
-		exec_fusermount(argv);
-		_exit(1);
-	} else if (pid != -1)
+	char const *const argv[] = {FUSERMOUNT_PROG, "--version", NULL};
+	pid_t pid;
+	int status = posix_spawn(&pid, FUSERMOUNT_DIR "/" FUSERMOUNT_PROG, NULL,
+			NULL, (char * const *) argv, environ)
+		&& posix_spawnp(&pid, FUSERMOUNT_PROG, NULL,
+			NULL, (char * const *) argv, environ);
+	if(status != 0)
+		perror("posix_spawn");
+	else
 		waitpid(pid, NULL, 0);
 }
 
@@ -293,7 +292,7 @@ static int receive_fd(int fd)
 void fuse_kern_unmount(const char *mountpoint, int fd)
 {
 	int res;
-	int pid;
+	pid_t pid;
 
 	if (!mountpoint)
 		return;
@@ -327,16 +326,16 @@ void fuse_kern_unmount(const char *mountpoint, int fd)
 	if (res == 0)
 		return;
 
-	pid = fork();
-	if(pid == -1)
+	char const * const argv[] =
+		{ FUSERMOUNT_PROG, "--unmount", "--quiet", "--lazy",
+				"--", mountpoint, NULL };
+	int status = posix_spawn(
+		&pid, FUSERMOUNT_DIR "/" FUSERMOUNT_PROG, NULL, NULL, (char * const *) argv, environ)
+		&& posix_spawnp(
+			&pid, FUSERMOUNT_PROG, NULL, NULL, (char * const *) argv, environ);
+	if(status != 0) {
+		perror("posix_spawn");
 		return;
-
-	if(pid == 0) {
-		const char *argv[] = { FUSERMOUNT_PROG, "-u", "-q", "-z",
-				       "--", mountpoint, NULL };
-
-		exec_fusermount(argv);
-		_exit(1);
 	}
 	waitpid(pid, NULL, 0);
 }
@@ -349,9 +348,9 @@ void fuse_unmount_compat22(const char *mountpoint)
 static int fuse_mount_fusermount(const char *mountpoint, struct mount_opts *mo,
 		const char *opts, int quiet)
 {
-	int fds[2], pid;
+	int fds[2];
+	pid_t pid;
 	int res;
-	int rv;
 
 	if (!mountpoint) {
 		fprintf(stderr, "fuse: missing mountpoint parameter\n");
@@ -364,47 +363,44 @@ static int fuse_mount_fusermount(const char *mountpoint, struct mount_opts *mo,
 		return -1;
 	}
 
-	pid = fork();
-	if(pid == -1) {
-		perror("fuse: fork() failed");
+	char arg_fd_entry[30];
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[0]);
+
+	char const *const argv[] = {
+		FUSERMOUNT_PROG,
+		"--comm-fd", arg_fd_entry,
+		"--options", opts ? opts : "",
+		"--",
+		mountpoint,
+		NULL,
+	};
+
+	posix_spawn_file_actions_t action;
+	posix_spawn_file_actions_init(&action);
+
+	if (quiet) {
+		posix_spawn_file_actions_addclose(&action, 1);
+		posix_spawn_file_actions_addclose(&action, 2);
+	}
+	posix_spawn_file_actions_addclose(&action, fds[1]);
+
+	int status = posix_spawn(&pid, FUSERMOUNT_DIR "/" FUSERMOUNT_PROG, &action,
+			NULL, (char *const *) argv, environ)
+		&& posix_spawnp(&pid, FUSERMOUNT_PROG, &action,
+			NULL, (char *const *) argv, environ);
+	posix_spawn_file_actions_destroy(&action);
+
+	if(status != 0) {
 		close(fds[0]);
 		close(fds[1]);
+		perror("fuse: posix_spawnp() of fusermount failed");
 		return -1;
 	}
 
-	if(pid == 0) {
-		char env[10];
-		const char *argv[32];
-		int a = 0;
-
-		if (quiet) {
-			int fd = open("/dev/null", O_RDONLY);
-			if (fd != -1) {
-				dup2(fd, 1);
-				dup2(fd, 2);
-			}
-		}
-
-		argv[a++] = FUSERMOUNT_PROG;
-		if (opts) {
-			argv[a++] = "-o";
-			argv[a++] = opts;
-		}
-		argv[a++] = "--";
-		argv[a++] = mountpoint;
-		argv[a++] = NULL;
-
-		close(fds[1]);
-		fcntl(fds[0], F_SETFD, 0);
-		snprintf(env, sizeof(env), "%i", fds[0]);
-		setenv(FUSE_COMMFD_ENV, env, 1);
-		exec_fusermount(argv);
-		perror("fuse: failed to exec fusermount");
-		_exit(1);
-	}
-
+	// passed to child now, so can close here.
 	close(fds[0]);
-	rv = receive_fd(fds[1]);
+
+	int rv = receive_fd(fds[1]);
 
 	if (!mo->auto_unmount) {
 		/* with auto_unmount option fusermount will not exit until 
